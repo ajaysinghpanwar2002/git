@@ -26,6 +26,7 @@ docker-run: docker-build
 	@echo "To pass arguments, use: make run ARGS=\"<your_args>\""
 	docker run --rm -it \
 	  -v "$(shell pwd)/.git_docker_data:/app/.git" \
+	  -v "$(shell pwd):/app" \
 	  --name $(DOCKER_CONTAINER_NAME) \
 	  $(DOCKER_IMAGE_NAME) $(ARGS)
 

@@ -30,5 +30,5 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/mygit ./mygit
-ENTRYPOINT ["./mygit"]
+COPY --from=builder /app/mygit /usr/local/bin/mygit
+ENTRYPOINT ["/usr/local/bin/mygit"]
