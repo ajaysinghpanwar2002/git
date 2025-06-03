@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <openssl/sha.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,7 +127,7 @@ int main(int argc, char *argv[]) {
 
     // create blob header: "blob <size>\0"
     char header[64];
-    int header_len = snprintf(header, sizeof(header), "blob %d", file_size);
+    int header_len = snprintf(header, sizeof(header), "blob %ld", file_size);
 
     // calculate total blob size (header + null byte + content)
     size_t blob_size = header_len + 1 + file_size;
@@ -195,6 +196,95 @@ int main(int argc, char *argv[]) {
     free(compressed_data);
 
     printf("%s\n", hash_hex);
+  } else if (strcmp(command, "ls-tree") == 0) {
+    if (argc < 4 || strcmp(argv[2], "--name-only")) {
+      fprintf(stderr, "Usage: ls-tree --name-only <tree_sha>\n");
+      return 1;
+    }
+
+    const char *hash = argv[3];
+    if (strlen(hash) != 40) {
+      fprintf(stderr, "Invalid hash length \n");
+      return 1;
+    }
+
+    // Construct object path: .git/objects/xx/remaining_38_chars
+    char object_path[256];
+    snprintf(object_path, sizeof(object_path), ".git/objects/%.2s/%s", hash,
+             hash + 2);
+
+    // open an read compressed file.
+    FILE *file = fopen(object_path, "rb");
+    if (!file) {
+      fprintf(stderr, "Failed to open object file: %s\n", strerror(errno));
+      return 1;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Read compressed data
+    unsigned char *compressed_data = malloc(file_size);
+    fread(compressed_data, 1, file_size, file);
+    fclose(file);
+
+    // Decompress using zlib
+    unsigned char decompressed_data[8192];
+    uLongf decompressed_size = sizeof(decompressed_data);
+
+    int result = uncompress(decompressed_data, &decompressed_size,
+                            compressed_data, file_size);
+    free(compressed_data);
+
+    if (result != Z_OK) {
+      fprintf(stderr, "Failed to decompress object data\n");
+      return 1;
+    }
+
+    // find the null byte that seprates header from content.
+    unsigned char *null_pos =
+        memchr(decompressed_data, '\0', decompressed_size);
+    if (!null_pos) {
+      fprintf(stderr, "Invalid tree object format \n");
+      return 1;
+    }
+
+    // content start after the null byte
+    unsigned char *content = null_pos + 1;
+    size_t content_size = decompressed_size - (content - decompressed_data);
+
+    // parse tree enteries
+    unsigned char *ptr = content;
+    unsigned char *end = content + content_size;
+
+    while (ptr < end) {
+      // Read mode (as string until space)
+      unsigned char *mode_start = ptr;
+      while (ptr < end && *ptr != ' ')
+        ptr++;
+      if (ptr >= end)
+        break;
+
+      // Skip space
+      ptr++;
+
+      // Read name (until null byte)
+      unsigned char *name_start = ptr;
+      while (ptr < end && *ptr != '\0')
+        ptr++;
+      if (ptr >= end)
+        break;
+
+      // Print the name
+      printf("%.*s\n", (int)(ptr - name_start), name_start);
+
+      // Skip null byte
+      ptr++;
+
+      // Skip 20-byte SHA hash
+      ptr += 20;
+    }
   } else {
     fprintf(stderr, "Unknown command %s\n", command);
     return 1;
