@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <errno.h>
 #include <openssl/sha.h>
 #include <stddef.h>
@@ -6,6 +7,197 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
+
+// Helper function to create a blob object and return its SHA-1 hash
+char *create_blob_object(const char *file_path) {
+  FILE *file = fopen(file_path, "rb");
+  if (!file)
+    return NULL;
+
+  fseek(file, 0, SEEK_END);
+  long file_size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+
+  unsigned char *file_content = malloc(file_size);
+  fread(file_content, 1, file_size, file);
+  fclose(file);
+
+  char header[64];
+  int header_len = snprintf(header, sizeof(header), "blob %ld", file_size);
+
+  size_t blob_size = header_len + 1 + file_size;
+  unsigned char *blob_data = malloc(blob_size);
+
+  memcpy(blob_data, header, header_len);
+  blob_data[header_len] = '\0';
+  memcpy(blob_data + header_len + 1, file_content, file_size);
+
+  unsigned char hash[SHA_DIGEST_LENGTH];
+  SHA1(blob_data, blob_size, hash);
+
+  char *hash_hex = malloc(41);
+  for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+    sprintf(hash_hex + i * 2, "%02x", hash[i]);
+  }
+  hash_hex[40] = '\0';
+
+  // Create directory and save blob
+  char dir_path[256];
+  snprintf(dir_path, sizeof(dir_path), ".git/objects/%.2s", hash_hex);
+  mkdir(dir_path, 0755);
+
+  char object_path[256];
+  snprintf(object_path, sizeof(object_path), "%s/%s", dir_path, hash_hex + 2);
+
+  uLongf compressed_size = compressBound(blob_size);
+  unsigned char *compressed_data = malloc(compressed_size);
+
+  compress(compressed_data, &compressed_size, blob_data, blob_size);
+
+  FILE *object_file = fopen(object_path, "wb");
+  fwrite(compressed_data, 1, compressed_size, object_file);
+  fclose(object_file);
+
+  free(file_content);
+  free(blob_data);
+  free(compressed_data);
+
+  return hash_hex;
+}
+
+char *create_tree_object(const char *dir_path) {
+  DIR *dir = opendir(dir_path);
+  if (!dir)
+    return NULL;
+
+  // collect enteries
+  struct dirent *entry;
+  // This will hold Git Mode, filename and SHA-1 hash for each file/directory.
+  struct {
+    char mode[10]; // eg "100644" for files, "40000" for dirs.
+    char name[256];
+    unsigned char hash[SHA_DIGEST_LENGTH]; // 20 byte SHA-1 hash of the blob
+  } entries[1000];
+
+  int entry_count = 0;
+  while ((entry = readdir(dir)) != NULL) {
+
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+        strcmp(entry->d_name, ".git") == 0) {
+      continue; // skip special enteries and the .git dir
+    }
+
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+
+    struct stat st;
+    if (stat(full_path, &st) != 0) {
+      continue;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+      // regular file - we need to create a blob object for it.
+      strcpy(entries[entry_count].mode, "100644");
+      strcpy(entries[entry_count].name, entry->d_name);
+      char *blob_hash = create_blob_object(full_path);
+      if (blob_hash) {
+        // convert the hexadecimal hash string to binary format
+        // Git tree objects store hashes as 20 raw bytes, not as hex strings
+        // Each hex digit pair (like 'a3') becomes one byte
+        for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+          sscanf(blob_hash + i * 2, "%2hhx", &entries[entry_count].hash[i]);
+        }
+        free(blob_hash);
+        entry_count++;
+      }
+    } else if (S_ISDIR(st.st_mode)) {
+      strcpy(entries[entry_count].mode, "40000");
+      strcpy(entries[entry_count].name, entry->d_name);
+      char *tree_hash = create_tree_object(full_path);
+      if (tree_hash) {
+        // converting the hexadecimal hash string to binary format.
+        for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+          sscanf(tree_hash + i * 2, "%2hhx", &entries[entry_count].hash[i]);
+        }
+        free(tree_hash);
+        entry_count++;
+      }
+    }
+  }
+  closedir(dir);
+
+  // Tree format: for each entry -> "mode filename\0<20-byte-hash>"
+  size_t content_size = 0;
+  for (int i = 0; i < entry_count; i++) {
+    content_size += strlen(entries[i].mode) + // Length of mode string
+                    1 +                       // Space between mode and name
+                    strlen(entries[i].name) + // length of filename
+                    1 +                       // null byte after filename
+                    SHA_DIGEST_LENGTH;        // 20 bytes for SHA-1 hash
+  }
+
+  // Git object format: "tree <content_size>\0<content>"
+  char header[64];
+  int header_len = snprintf(header, sizeof(header), "tree %zu", content_size);
+
+  // calculate total tree object size (header + null byte + content)
+  size_t tree_size = header_len + 1 + content_size;
+  unsigned char *tree_data = malloc(tree_size);
+
+  // build tree object
+  memcpy(tree_data, header, header_len);
+  tree_data[header_len] = '\0';
+
+  // build tree content
+  unsigned char *ptr =
+      tree_data + header_len + 1; // point to start of content area
+
+  for (int i = 0; i < entry_count; i++) {
+    // for each entry, write "mode filename\0<20-byte-hash>"
+    memcpy(ptr, entries[i].mode, strlen(entries[i].mode));
+    ptr += strlen(entries[i].mode);
+
+    *ptr++ = '\0';
+
+    memcpy(ptr, entries[i].hash, SHA_DIGEST_LENGTH);
+    ptr += SHA_DIGEST_LENGTH;
+  }
+  // SHA-1 hash for the complete object
+  unsigned char hash[SHA_DIGEST_LENGTH];
+  SHA1(tree_data, tree_size, hash);
+
+  // convert binary hash to hexadecimal string for the display and file naming
+  char *hash_hex = malloc(41); // 40 hex char + null terminator
+  for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+    sprintf(hash_hex + i * 2, "%02x", hash[i]);
+  }
+  hash_hex[40] = '\0';
+
+  // save the tree object to .git/objects dir
+  char dir_path_obj[256];
+  snprintf(dir_path_obj, sizeof(dir_path_obj), ".git/objects/%.2s", hash_hex);
+  mkdir(dir_path_obj, 0755);
+
+  char object_path[256];
+  snprintf(object_path, sizeof(object_path), "%s/%s", dir_path_obj,
+           hash_hex + 2);
+
+  // compress the tree object
+  uLongf compressed_size = compressBound(tree_size);
+  unsigned char *compressed_data = malloc(compressed_size);
+
+  // compression
+  compress(compressed_data, &compressed_size, tree_data, tree_size);
+
+  FILE *object_file = fopen(object_path, "wb");
+  fwrite(compressed_data, 1, compressed_size, object_file);
+  fclose(object_file);
+
+  free(tree_data);
+  free(compressed_data);
+
+  return hash_hex;
+}
 
 int main(int argc, char *argv[]) {
   setbuf(stdout, NULL);
@@ -284,6 +476,15 @@ int main(int argc, char *argv[]) {
 
       // Skip 20-byte SHA hash
       ptr += 20;
+    }
+  } else if (strcmp(command, "write-tree") == 0) {
+    char *tree_hash = create_tree_object(".");
+    if (tree_hash) {
+      printf("%s\n", tree_hash);
+      free(tree_hash);
+    } else {
+      fprintf(stderr, "Failed to create a tree object \n");
+      return 1;
     }
   } else {
     fprintf(stderr, "Unknown command %s\n", command);
